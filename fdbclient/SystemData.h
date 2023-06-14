@@ -229,6 +229,10 @@ extern const KeyRef perpetualStorageWiggleLocalityKey;
 extern const KeyRef perpetualStorageWiggleIDPrefix;
 extern const KeyRef perpetualStorageWiggleStatsPrefix;
 
+extern const KeyRangeRef consistencyCheckResults;
+extern const KeyRef consistencyCheckResultPrefix;
+extern const KeyRef consistencyCheckResultVersionKey;
+
 // Change the value of this key to anything and that will trigger detailed data distribution team info log.
 extern const KeyRef triggerDDTeamInfoPrintKey;
 

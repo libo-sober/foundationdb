@@ -56,6 +56,36 @@ const KeyRef JSONSchemas::statusSchema = LiteralStringRef(R"statusSchema(
             "finished_wiggle": 1
          }
       },
+      "consistent_check":{
+         cache_inconsistent_data:{
+            fdbser1:{
+               Peer: xxx;
+               ShardBegin: xxx;
+               ShardEnd: xxx;
+               ValueMismatches: xxx;
+               ValueMismatchKey: xxx;
+               MatchingKVPairs: xxx;
+            },
+            fdbser2:{
+               Peer: xxx;
+               ShardBegin: xxx;
+               ShardEnd: xxx;
+               ValueMismatches: xxx;
+               ValueMismatchKey: xxx;
+               MatchingKVPairs: xxx;
+            },
+         },
+         cache_inconsistent_key_server:{
+            fdbserver_id_13: {
+                  storage_server1: fdbser1;
+                  storage_server2: fdbser2;
+            },
+            fdbserver_id_24: {
+                  storage_server1: fdbser1;
+                  storage_server2: fdbser2;
+            },
+         }
+      },
       "layers":{
          "_valid":true,
          "_error":"some error description"

@@ -18,6 +18,8 @@
  * limitations under the License.
  */
 
+#include<boost/algorithm/string.hpp>
+#include<vector>
 #include <cinttypes>
 #include "contrib/fmt-8.1.1/include/fmt/format.h"
 #include "fdbclient/BlobWorkerInterface.h"
@@ -39,6 +41,8 @@
 #include "fdbserver/Knobs.h"
 #include "fdbclient/JsonBuilder.h"
 #include "flow/actorcompiler.h" // This must be the last #include.
+
+using namespace boost::algorithm;
 
 const char* RecoveryStatus::names[] = { "reading_coordinated_state",
 	                                    "locking_coordinated_state",
@@ -1471,6 +1475,58 @@ ACTOR static Future<Void> consistencyCheckStatusFetcher(Database cx,
 		incomplete_reasons->insert(format("Unable to retrieve consistency check settings (%s).", e.what()));
 	}
 	return Void();
+}
+
+ACTOR static Future<JsonBuilderObject> consistencyCheckResultFetcher(Database cx,
+                                                                     std::set<std::string>* incomplete_reasons) {
+	state JsonBuilderObject statusObj;
+	try {
+		state Transaction tr(cx);
+
+		loop {
+			tr.setOption(FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE);
+			tr.setOption(FDBTransactionOptions::LOCK_AWARE);
+			tr.setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
+
+			state Future<RangeResult> checkResult = tr.getRange(consistencyCheckResults, CLIENT_KNOBS->TOO_MANY);
+			wait(success(checkResult));
+
+			TraceEvent(SevInfo, "consistencyCheckResultFetcher").detail("status", "start");
+
+		    JsonBuilderObject consistentErrorKindObj;
+
+			for (auto& it : checkResult.get()) {
+				JsonBuilderObject fdbServerObj;
+				std::vector< std::string > unconsistentMessage;
+
+				split(unconsistentMessage, it.key.toString().c_str(), is_any_of("/"), token_compress_on);
+
+				auto unconsistentKind = unconsistentMessage[2];
+				auto unconsistentServer = unconsistentMessage[3];
+				auto unconsistentServerInfo = unconsistentMessage[4];
+
+				// TODO: Optimize display
+				fdbServerObj[unconsistentServerInfo] = it.value;
+				consistentErrorKindObj[unconsistentServer] = fdbServerObj;
+				statusObj[unconsistentKind] = consistentErrorKindObj;
+				
+				TraceEvent(SevWarnAlways, "consistencyCheckResultFetcher")
+				    .detail("K", it.key.printable())
+				    .detail("V", it.value.printable());
+			}
+			break;
+		}
+		TraceEvent(SevInfo, "consistencyCheckResultFetcher").detail("status", "done");
+	    return statusObj;
+	} catch (Error& e) {
+		statusObj["consistency_check"] = format("Unable to retrieve consistency check settings (%s).", e.what());
+		if (e.code() == error_code_actor_cancelled) {
+			throw;
+		}
+		incomplete_reasons->insert(format("Unable to retrieve consistency check settings (%s).", e.what()));
+	}
+	TraceEvent(SevInfo, "consistencyCheckResultFetcher").detail("status", "failed");
+	return statusObj;
 }
 
 struct LogRangeAndUID {
@@ -2968,6 +3024,7 @@ ACTOR Future<StatusReply> clusterGetStatus(
 		state JsonBuilderObject qos;
 		state JsonBuilderObject dataOverlay;
 		state JsonBuilderObject storageWiggler;
+		state JsonBuilderObject consistencyChecker;
 		state std::unordered_set<UID> wiggleServers;
 
 		statusObj["protocol_version"] = format("%" PRIx64, g_network->protocolVersion().version());
@@ -3019,6 +3076,17 @@ ACTOR Future<StatusReply> clusterGetStatus(
 			state std::vector<Future<Void>> warningFutures;
 			if (isAvailable) {
 				warningFutures.push_back(consistencyCheckStatusFetcher(cx, &messages, &status_incomplete_reasons));
+
+				JsonBuilderObject consistentCheckResults =
+				    wait(consistencyCheckResultFetcher(cx, &status_incomplete_reasons));
+
+				TraceEvent(SevInfo, "consistentCheckStatus").detail("result", "done");
+
+				// if (!consistentCheckResults.empty()) {
+					TraceEvent(SevInfo, "consistentCheckStatus").detail("ok", consistentCheckResults.getJson());
+					statusObj["consistent_check"] = consistentCheckResults;
+                // }
+
 				if (!SERVER_KNOBS->DISABLE_DUPLICATE_LOG_WARNING) {
 					warningFutures.push_back(logRangeWarningFetcher(cx, &messages, &status_incomplete_reasons));
 				}

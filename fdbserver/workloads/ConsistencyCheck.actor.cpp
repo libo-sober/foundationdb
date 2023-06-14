@@ -339,13 +339,21 @@ struct ConsistencyCheckWorkload : TestWorkload {
 					}
 				}
 			} catch (Error& e) {
+				state Transaction failureTr(cx);
+				failureTr.setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
 				if (e.code() == error_code_transaction_too_old || e.code() == error_code_future_version ||
 				    e.code() == error_code_wrong_shard_server || e.code() == error_code_all_alternatives_failed ||
-				    e.code() == error_code_process_behind)
-					TraceEvent("ConsistencyCheck_Retry")
+				    e.code() == error_code_process_behind){
+						TraceEvent("ConsistencyCheck_Retry")
 					    .error(e); // FIXME: consistency check does not retry in this case
-				else
+						failureTr.clear(format("%sconsistencycheck_error", consistencyCheckResultPrefix.toString().c_str()));
+					}
+				else{
+					failureTr.set(format("%sconsistencycheck_error", consistencyCheckResultPrefix.toString().c_str()),
+							      format("Error %d - %s", e.code(), e.name()));
 					self->testFailure(format("Error %d - %s", e.code(), e.name()));
+				}
+				wait(failureTr.commit());
 			}
 		}
 
@@ -576,6 +584,11 @@ struct ConsistencyCheckWorkload : TestWorkload {
 							else {
 								GetKeyValuesReply reference = keyValueFutures[firstValidServer].get().get();
 
+								auto cache_inconsistent_data_server = format(
+									    "%scache_inconsistent_data/%s", consistencyCheckResultPrefix.toString().c_str(), iter_ss[j].toString());
+								state Transaction cacheDataStatusTr(cx);
+								cacheDataStatusTr.setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
+
 								if (current.data != reference.data || current.more != reference.more) {
 									// Be especially verbose if in simulation
 									if (g_network->isSimulated()) {
@@ -685,9 +698,28 @@ struct ConsistencyCheckWorkload : TestWorkload {
 									    .detail("ValueMismatchKey", valueMismatchKey)
 									    .detail("MatchingKVPairs", matchingKVPairs);
 
+									cacheDataStatusTr.set(format("%s/Peer", cache_inconsistent_data_server),
+									                 format("%s", iter_ss[firstValidServer].toString()));
+									cacheDataStatusTr.set(format("%s/ShardBegin", cache_inconsistent_data_server),
+									                 format("%s", req.begin.getKey()));
+									cacheDataStatusTr.set(format("%s/ShardEnd", cache_inconsistent_data_server), req.end.getKey());
+									cacheDataStatusTr.set(format("%s/ValueMismatches", cache_inconsistent_data_server),
+									                 format("%d", valueMismatches));
+									cacheDataStatusTr.set(format("%s/ValueMismatchKey", cache_inconsistent_data_server),
+									                 format("%s", valueMismatchKey));
+									cacheDataStatusTr.set(format("%s/MatchingKVPairs", cache_inconsistent_data_server),
+									                 format("%d", matchingKVPairs));
 									self->testFailure("Data inconsistent", true);
 									testResult = false;
+								}else{
+									cacheDataStatusTr.clear(format("%s/Peer", cache_inconsistent_data_server));
+									cacheDataStatusTr.clear(format("%s/ShardBegin", cache_inconsistent_data_server));
+									cacheDataStatusTr.clear(format("%s/ShardEnd", cache_inconsistent_data_server));
+									cacheDataStatusTr.clear(format("%s/ValueMismatches", cache_inconsistent_data_server));
+									cacheDataStatusTr.clear(format("%s/ValueMismatchKey", cache_inconsistent_data_server));
+									cacheDataStatusTr.clear(format("%s/MatchingKVPairs", cache_inconsistent_data_server));
 								}
+								wait(cacheDataStatusTr.commit());
 							}
 						}
 					}
@@ -757,6 +789,7 @@ struct ConsistencyCheckWorkload : TestWorkload {
 		state Key beginKey = allKeys.begin.withPrefix(range.begin);
 		state Key endKey = allKeys.end.withPrefix(range.begin);
 		state int i; // index
+		state int j;
 		state Transaction onErrorTr(cx); // This transaction exists only to access onError and its backoff behavior
 
 		// If the responses are too big, we may use multiple requests to get the key locations.  Each request begins
@@ -788,11 +821,15 @@ struct ConsistencyCheckWorkload : TestWorkload {
 
 					wait(waitForAll(keyValueFutures));
 
-					int firstValidStorageServer = -1;
+					state int firstValidStorageServer = -1;
 
 					// Read the shard location results
-					for (int j = 0; j < keyValueFutures.size(); j++) {
+					for (j = 0; j < keyValueFutures.size(); j++) {
 						ErrorOr<GetKeyValuesReply> reply = keyValueFutures[j].get();
+
+						state bool inconsistentKeyServerFlag = false;
+						state Transaction ssStatusTr(cx);
+						ssStatusTr.setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
 
 						if (!reply.present() || reply.get().error.present()) {
 							// If the storage server didn't reply in a quiescent database, then the check fails
@@ -819,9 +856,26 @@ struct ConsistencyCheckWorkload : TestWorkload {
 							TraceEvent("CacheConsistencyCheck_InconsistentKeyServers")
 							    .detail("StorageServer1", shards[i].second[firstValidStorageServer].id())
 							    .detail("StorageServer2", shards[i].second[j].id());
+
+							ssStatusTr.set(format("%scache_inconsistent_key_server/fdbserver_id_%d%d/storage_server1",
+							                      consistencyCheckResultPrefix.toString().c_str(), i, j),
+										   format("%s", shards[i].second[firstValidStorageServer].id().toString()));
+							ssStatusTr.set(format("%scache_inconsistent_key_server/fdbserver_id_%d%d/storage_server2",
+							                      consistencyCheckResultPrefix.toString().c_str(), i, j),
+										   format("%s", shards[i].second[j].id().toString()));
 							self->testFailure("Key servers inconsistent", true);
-							return false;
+							inconsistentKeyServerFlag = true;
 						}
+						if (!inconsistentKeyServerFlag){
+							ssStatusTr.clear(format("%scache_inconsistent_key_server/fdbserver_id_%d%d/storage_server1",
+							                      consistencyCheckResultPrefix.toString().c_str()));
+							ssStatusTr.clear(format("%scache_inconsistent_key_server/fdbserver_id_%d%d/storage_server2",
+							                      consistencyCheckResultPrefix.toString().c_str()));
+						}
+						wait(ssStatusTr.commit());
+						if (inconsistentKeyServerFlag){
+							return false;
+						}	
 					}
 
 					auto keyValueResponse = keyValueFutures[firstValidStorageServer].get().get();
@@ -846,7 +900,7 @@ struct ConsistencyCheckWorkload : TestWorkload {
 				}
 			}
 		}
-
+		// wait(ssStatusTr.commit());
 		resultPromise.send(result);
 		return true;
 	}
@@ -951,6 +1005,7 @@ struct ConsistencyCheckWorkload : TestWorkload {
 		state Key beginKey = allKeys.begin.withPrefix(keyServersPrefix);
 		state Key endKey = allKeys.end.withPrefix(keyServersPrefix);
 		state int i = 0;
+		state int j = 0;
 		state Transaction onErrorTr(cx); // This transaction exists only to access onError and its backoff behavior
 
 		// If the responses are too big, we may use multiple requests to get the key locations.  Each request begins
@@ -980,11 +1035,14 @@ struct ConsistencyCheckWorkload : TestWorkload {
 
 					wait(waitForAll(keyValueFutures));
 
-					int firstValidStorageServer = -1;
+					state int firstValidStorageServer = -1;
 
 					// Read the shard location results
-					for (int j = 0; j < keyValueFutures.size(); j++) {
+					for (j = 0; j < keyValueFutures.size(); j++) {
 						ErrorOr<GetKeyValuesReply> reply = keyValueFutures[j].get();
+
+						state Transaction klStatusTr(cx);
+						klStatusTr.setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
 
 						if (!reply.present() || reply.get().error.present()) {
 							// If the storage server didn't reply in a quiescent database, then the check fails
@@ -1011,8 +1069,22 @@ struct ConsistencyCheckWorkload : TestWorkload {
 							TraceEvent("ConsistencyCheck_InconsistentKeyServers")
 							    .detail("StorageServer1", shards[i].second[firstValidStorageServer].id())
 							    .detail("StorageServer2", shards[i].second[j].id());
+
+							klStatusTr.set(format("%sinconsistent_key_server/fdbserver_id_%d%d/storage_server1",
+							                      consistencyCheckResultPrefix.toString().c_str(), i, j),
+							               format("%s", shards[i].second[firstValidStorageServer].id().toString()));
+							klStatusTr.set(format("%sinconsistent_key_server/fdbserver_id_%d%d/storage_server2",
+							                      consistencyCheckResultPrefix.toString().c_str(), i, j),
+							               format("%s", shards[i].second[j].id().toString()));
 							self->testFailure("Key servers inconsistent", true);
+							wait(klStatusTr.commit());
 							return false;
+						}else{
+							klStatusTr.clear(format("%sinconsistent_key_server/fdbserver_id_%d%d/storage_server1",
+							                      consistencyCheckResultPrefix.toString().c_str()));
+							klStatusTr.clear(format("%sinconsistent_key_server/fdbserver_id_%d%d/storage_server2",
+							                      consistencyCheckResultPrefix.toString().c_str()));
+							wait(klStatusTr.commit());
 						}
 					}
 
@@ -1050,7 +1122,6 @@ struct ConsistencyCheckWorkload : TestWorkload {
 				}
 			}
 		}
-
 		keyLocationPromise.send(keyLocations);
 		return true;
 	}
@@ -1570,13 +1641,38 @@ struct ConsistencyCheckWorkload : TestWorkload {
 										                ? "True"
 										                : "False");
 
+										auto inconsistent_data_server = format(
+											"%sinconsistent_data/%s", consistencyCheckResultPrefix.toString().c_str(), storageServers[j].toString());
+										state Transaction dataStatusTr(cx);
+										dataStatusTr.setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
+
 										if ((g_network->isSimulated() &&
 										     g_simulator.tssMode != ISimulator::TSSMode::EnabledDropMutations) ||
 										    (!storageServerInterfaces[j].isTss() &&
-										     !storageServerInterfaces[firstValidServer].isTss())) {
+										     !storageServerInterfaces[firstValidServer].isTss())) {										
+
+											dataStatusTr.set(format("%s/Peer", inconsistent_data_server),
+															format("%s", storageServers[firstValidServer].toString()));
+											dataStatusTr.set(format("%s/ShardBegin", inconsistent_data_server),
+															format("%s", req.begin.getKey()));
+											dataStatusTr.set(format("%s/ShardEnd", inconsistent_data_server), req.end.getKey());
+											dataStatusTr.set(format("%s/ValueMismatches", inconsistent_data_server),
+															format("%d", valueMismatches));
+											dataStatusTr.set(format("%s/ValueMismatchKey", inconsistent_data_server),
+															format("%s", valueMismatchKey));
+											dataStatusTr.set(format("%s/MatchingKVPairs", inconsistent_data_server),
+															format("%d", matchingKVPairs));
 											self->testFailure("Data inconsistent", true);
 											testResult = false;
+										}else{
+											dataStatusTr.clear(format("%s/Peer", inconsistent_data_server));
+											dataStatusTr.clear(format("%s/ShardBegin", inconsistent_data_server));
+											dataStatusTr.clear(format("%s/ShardEnd", inconsistent_data_server));
+											dataStatusTr.clear(format("%s/ValueMismatches", inconsistent_data_server));
+											dataStatusTr.clear(format("%s/ValueMismatchKey", inconsistent_data_server));
+											dataStatusTr.clear(format("%s/MatchingKVPairs", inconsistent_data_server));
 										}
+										wait(dataStatusTr.commit());
 									}
 								}
 							}
@@ -1598,10 +1694,25 @@ struct ConsistencyCheckWorkload : TestWorkload {
 								            storageServerInterfaces[j].getKeyValues.getEndpoint().token)
 								    .detail("IsTSS", storageServerInterfaces[j].isTss() ? "True" : "False");
 
+								state Transaction storageStatusTr(cx);
+								storageStatusTr.setOption(FDBTransactionOptions::ACCESS_SYSTEM_KEYS);
+								auto unavailable_storage_server = format(
+									    "%sunavailable_storage_server/%s", consistencyCheckResultPrefix.toString().c_str(), storageServers[j].toString());
+
 								// All shards should be available in quiscence
 								if (self->performQuiescentChecks && !storageServerInterfaces[j].isTss()) {
+
+									storageStatusTr.set(format("%s/ShardBegin", unavailable_storage_server), format("%s", printable(range.begin)));
+									storageStatusTr.set(format("%s/ShardEnd", unavailable_storage_server), format("%s", printable(range.end)));
+									storageStatusTr.set(format("%s/Address", unavailable_storage_server), format("%s", storageServerInterfaces[j].address()));
 									self->testFailure("Storage server unavailable");
+									wait(storageStatusTr.commit());
 									return false;
+								}else{
+									storageStatusTr.clear(format("%s/ShardBegin", unavailable_storage_server));
+									storageStatusTr.clear(format("%s/ShardEnd", unavailable_storage_server));
+									storageStatusTr.clear(format("%s/Address", unavailable_storage_server));
+									wait(storageStatusTr.commit());
 								}
 							}
 						}

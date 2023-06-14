@@ -670,6 +670,10 @@ const KeyRef perpetualStorageWiggleIDPrefix(
 const KeyRef perpetualStorageWiggleStatsPrefix(
     LiteralStringRef("\xff/storageWiggleStats/")); // withSuffix /primary or /remote
 
+const KeyRangeRef consistencyCheckResults(LiteralStringRef("\xff/consistency_check/"), LiteralStringRef("\xff/consistency_check0"));
+const KeyRef consistencyCheckResultPrefix = consistencyCheckResults.begin;
+const KeyRef consistencyCheckResultVersionKey = LiteralStringRef("\xff/consistency_check");
+
 const KeyRef triggerDDTeamInfoPrintKey(LiteralStringRef("\xff/triggerDDTeamInfoPrint"));
 
 const KeyRangeRef excludedServersKeys(LiteralStringRef("\xff/conf/excluded/"), LiteralStringRef("\xff/conf/excluded0"));
